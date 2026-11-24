@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#000000" />
+  <title>粒子爱心</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+    }
+
+    body {
+      position: relative;
+      overscroll-behavior: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #heart {
+      position: fixed;
+      inset: 0;
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+
+    .fallback {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      margin: 0;
+      padding: 24px;
+      color: #fff;
+      font: 16px/1.7 "PingFang SC", "Microsoft YaHei", sans-serif;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <canvas
+    id="heart"
+    role="img"
+    aria-label="纯黑背景中，一颗由亮粉色粒子组成的动态爱心。点击爱心，粒子会落下并聚成五行滚动的人名"
+  ></canvas>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const canvas = document.getElementById('heart');
+      const TAU = Math.PI * 2;
+      const MAX_DPR = 2;
+      const SHAPE_CENTER_Y = 0.1586483622;
+      const OUTLINE_STEPS = 2600;
+      const BASE_DIAMETER = 16.5;
+      const FALL_GRAVITY = 1550;
+      const BREATH_SPEED = 0.95;
+
+      // 五行名字。每个名字固定三个字，名字之间不留标点，只留全角空格。
+      const NAME_ROWS = [
+        ['杜轩泽', '王嘉宇', '路子涵', '李悦绮', '蔡轶姝'],
+        ['李秋娴', '冯晨宇', '吕昱良', '姚佳睿', '程凡格'],
+        ['贾晓睿', '张芷晴', '杨佳音', '姬铭薇', '徐诗尧'],
+        ['王艺涵', '商木妍', '李晨旭', '桑家强', '邵俊尧'],
+        ['齐梓卉', '任星宇', '王嘉乐', '樊奕佳', '崔嘉轩']
+      ];
+
+      // 文字粒子直接取用爱心调色板；亮度从中间行向上下两端对称递减。
+      const NAME_STYLES = [
+        {
+          highlight: 0.55,
+          sizeScale: 0.95,
+          speed: 0.116
+        },
+        {
+          highlight: 0.8,
+          sizeScale: 1.04,
+          speed: 0.099
+        },
+        {
+          highlight: 1.12,
+          sizeScale: 1.15,
+          speed: 0.084
+        },
+        {
+          highlight: 0.8,
+          sizeScale: 1.04,
+          speed: 0.099
+        },
+        {
+          highlight: 0.55,
+          sizeScale: 0.95,
+          speed: 0.116
+        }
+      ];
+
+      const TEXT_START_DELAY = 1;
+      const TEXT_REVEAL_DURATION = 0.78;
+      const TEXT_ROW_DELAY = 0.15;
+      const TEXT_DESIGN_FONT_SIZE = 100;
+      const TEXT_DESIGN_HEIGHT = 152;
+      const TEXT_SAMPLE_STEP = 2.35;
+      const TEXT_MAX_COPIES = 2;
+
+      // 从玫粉到浅粉白；写入 GPU 前转换成 0–1 的 RGB
+      const PALETTE = [
+        { rgb: [255, 98, 162], weight: 0.16 },
+        { rgb: [255, 120, 176], weight: 0.27 },
+        { rgb: [255, 144, 191], weight: 0.26 },
+        { rgb: [255, 172, 207], weight: 0.20 },
+        { rgb: [255, 215, 232], weight: 0.11 }
+      ].map((entry) => ({
+        rgb: entry.rgb.map((channel) => channel / 255),
+        weight: entry.weight
+      }));
+
+      let gl = null;
+      let glowTexture = null;
+      let program = null;
+      let positionBuffer = null;
+      let colorBuffer = null;
+      let dynamicData = null;
+      let attributes = null;
+      let uniforms = null;
+
+      let textPositionBuffer = null;
+      let textColorBuffer = null;
+      let textDynamicData = null;
+      let textRows = null;
+      let textParticleCount = 0;
+      let textDrawCount = 0;
+
+      let dustPositionBuffer = null;
+      let dustColorBuffer = null;
+      let dustParticles = null;
+      let dustDynamicData = null;
+      let dustCount = 0;
+
+      let width = 0;
+      let height = 0;
+      let dpr = 1;
+      let centerX = 0;
+      let centerY = 0;
+      let sceneScale = 0;
+      let particleUnit = 1;
+      let particles = [];
+      let particleCount = 0;
+      let lastTime = 0;
+      let resizeTimer = 0;
+
+      let outlineSamples = [];
+      let outlineTotal = 0;
+      let heartPolygon = [];
+
+      const pointer = {
+        x: 0,
+        y: 0,
+        active: false,
+        influence: 0
+      };
+
+      const interaction = {
+        state: 'idle',
+        textStartTime: 0
+      };
+
+      const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+      const rand = (min, max) => min + Math.random() * (max - min);
+      const smoothstep = (min, max, value) => {
+        const t = clamp((value - min) / (max - min), 0, 1);
+        return t * t * (3 - 2 * t);
+      };
+
+      // ---------- 心形几何 ----------
+      // x = sin^3(t)
+      // y = -(13cos t - 5cos 2t - 2cos 3t - cos 4t) / 16
+      // 纵向减去包围盒中心，使心形围绕 (0, 0) 居中。
+      // 下半部分向中心收拢并略微向下拉伸，形成更尖的下缘。
+      function heartPoint(t) {
+        const s = Math.sin(t);
+        const c = Math.cos(t);
+        const c2 = Math.cos(2 * t);
+        const c3 = Math.cos(3 * t);
+        const c4 = Math.cos(4 * t);
+
+        let x = s * s * s;
+        let y = -(13 * c - 5 * c2 - 2 * c3 - c4) / 16 - SHAPE_CENTER_Y;
+
+        const tail = smoothstep(0.24, 0.9, y);
+        x *= 1 - 0.25 * tail;
+        y += 0.058 * tail * tail;
+
+        return { x, y };
+      }
+
+      // 曲线外法线，用于生成有厚度的轮廓颗粒带。
+      // 使用数值切线，保证心形底部形变后法线仍然连续。
+      function heartNormal(t) {
+        const epsilon = 0.0008;
+        const before = heartPoint(t - epsilon);
+        const after = heartPoint(t + epsilon);
+        const dx = after.x - before.x;
+        const dy = after.y - before.y;
+        const length = Math.hypot(dx, dy) || 1;
+
+        return { x: dy / length, y: -dx / length };
+      }
+
+      function createOutline() {
+        outlineSamples = [];
+        heartPolygon = [];
+        let accumulated = 0;
+        let previous = heartPoint(0);
+
+        for (let i = 0; i <= OUTLINE_STEPS; i++) {
+          const t = (i / OUTLINE_STEPS) * TAU;
+          const point = heartPoint(t);
+
+          if (i > 0) {
+            accumulated += Math.hypot(
+              point.x - previous.x,
+              point.y - previous.y
+            );
+          }
+
+          const normal = heartNormal(t);
+          const sample = {
+            x: point.x,
+            y: point.y,
+            nx: normal.x,
+            ny: normal.y,
+            t,
+            distance: accumulated
+          };
+
+          outlineSamples.push(sample);
+          if (i % 4 === 0) {
+            heartPolygon.push({ x: point.x, y: point.y });
+          }
+          previous = point;
+        }
+
+        outlineTotal = accumulated;
+      }
+
+      // 按弧长采样，避免尖角处粒子过密
+      function sampleOutline() {
+        const target = Math.random() * outlineTotal;
+        let low = 0;
+        let high = outlineSamples.length - 1;
+
+        while (low < high) {
+          const middle = (low + high) >> 1;
+          if (outlineSamples[middle].distance < target) {
+            low = middle + 1;
+          } else {
+            high = middle;
+          }
+        }
+
+        return outlineSamples[Math.min(low, outlineSamples.length - 1)];
+      }
+
+      function isInsideHeart(x, y) {
+        let inside = false;
+
+        for (let i = 0, j = heartPolygon.length - 1;
+          i < heartPolygon.length;
+          j = i++
+        ) {
+          const a = heartPolygon[i];
+          const b = heartPolygon[j];
+
+          if ((a.y > y) !== (b.y > y)
+            && x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) {
+            inside = !inside;
+          }
+        }
+
+        return inside;
+      }
+
+      // ---------- 粒子采样 ----------
+      function sampleEdge() {
+        const point = sampleOutline();
+        const roll = Math.random();
+        let normalOffset;
+
+        if (roll < 0.58) {
+          // 轮廓上最浓密的主带
+          normalOffset = (
+            Math.random()
+            + Math.random()
+            + Math.random()
+            - 1.5
+          ) * 0.112;
+        } else if (roll < 0.86) {
+          // 向心形内部铺开的稀疏过渡带
+          normalOffset = -Math.pow(Math.random(), 1.42) * 0.245;
+        } else {
+          // 向外部逸散的少量颗粒
+          normalOffset = Math.pow(Math.random(), 1.62) * 0.19;
+        }
+
+        // 轮廓厚度产生缓慢、不均匀的起伏；底部收束，避免心尖被雾化。
+        const tail = smoothstep(0.24, 0.88, point.y);
+        const thickness = 0.84
+          + 0.14 * Math.sin(point.t * 3.1 + 1.3)
+          + 0.075 * Math.sin(point.t * 8.7 + 0.6);
+        normalOffset *= thickness * (1 - 0.58 * tail);
+
+        const tangentJitter = (Math.random() - 0.5)
+          * 0.015
+          * (1 - 0.8 * tail);
+
+        return {
+          x: point.x
+            + point.nx * normalOffset
+            - point.ny * tangentJitter,
+          y: point.y
+            + point.ny * normalOffset
+            + point.nx * tangentJitter,
+          nx: point.nx,
+          ny: point.ny,
+          tx: -point.ny,
+          ty: point.nx
+        };
+      }
+
+      function sampleInner() {
+        const point = sampleOutline();
+        let radius;
+
+        if (Math.random() < 0.74) {
+          // 靠近内缘的一侧更密，向中心逐渐变淡
+          radius = 0.12 + 0.85 * Math.pow(Math.random(), 0.57);
+        } else {
+          radius = 0.025 + 0.88 * Math.sqrt(Math.random());
+        }
+
+        return {
+          x: point.x * radius + rand(-0.01, 0.01),
+          y: point.y * radius + rand(-0.01, 0.01),
+          nx: point.nx,
+          ny: point.ny,
+          tx: -point.ny,
+          ty: point.nx
+        };
+      }
+
+      function sampleOuter() {
+        if (Math.random() < 0.72) {
+          const point = sampleOutline();
+          const tail = smoothstep(0.24, 0.88, point.y);
+          const distance = (
+            0.015 + Math.pow(Math.random(), 1.6) * 0.27
+          ) * (1 - 0.62 * tail);
+          const jitter = rand(-0.075, 0.075)
+            * distance
+            * (1 - 0.72 * tail);
+
+          return {
+            x: point.x + point.nx * distance - point.ny * jitter,
+            y: point.y + point.ny * distance + point.nx * jitter,
+            nx: point.nx,
+            ny: point.ny,
+            tx: -point.ny,
+            ty: point.nx
+          };
+        }
+
+        // 少量更远的背景尘埃
+        for (let attempt = 0; attempt < 16; attempt++) {
+          const x = rand(-0.47, 0.47) * width / sceneScale;
+          const y = rand(-0.46, 0.46) * height / sceneScale;
+
+          if (!isInsideHeart(x, y)) {
+            return { x, y, nx: 1, ny: 0, tx: 0, ty: 1 };
+          }
+        }
+
+        return { x: 0, y: -1.45, nx: 0, ny: -1, tx: 1, ty: 0 };
+      }
+
+      // ---------- 粒子属性 ----------
+      function pickColor() {
+        let value = Math.random();
+        let total = 0;
+
+        for (let i = 0; i < PALETTE.length; i++) {
+          total += PALETTE[i].weight;
+          if (value <= total) return PALETTE[i].rgb;
+        }
+
+        return PALETTE[0].rgb;
+      }
+
+      function createParticle(kind) {
+        let point;
+        let size;
+        let alpha;
+        let wander;
+        let wanderSpeedX;
+        let wanderSpeedY;
+        let tangentAmount;
+        let cycleAmount = 0;
+        let cycleSpeed = 0;
+        let cyclePhase = 0;
+        let spring;
+        let damping;
+
+        if (kind === 'edge') {
+          point = sampleEdge();
+          const sizeRoll = Math.random();
+          if (sizeRoll < 0.57) {
+            size = rand(0.28, 0.62);
+            alpha = rand(0.55, 0.9);
+          } else if (sizeRoll < 0.91) {
+            size = rand(0.64, 1.0);
+            alpha = rand(0.38, 0.7);
+          } else {
+            // 大而很淡的光点，用来填补颗粒之间的空隙
+            size = rand(1.2, 2.15);
+            alpha = rand(0.075, 0.16);
+          }
+          wander = rand(0.0008, 0.0035);
+          wanderSpeedX = rand(0.2, 0.55);
+          wanderSpeedY = rand(0.18, 0.5);
+          tangentAmount = rand(0.001, 0.0055);
+          spring = rand(21, 30);
+          damping = rand(8, 11);
+
+          // 一部分边缘粒子会缓慢脱离轮廓，再回到心形
+          if (Math.random() < 0.2) {
+            cycleAmount = rand(0.012, 0.072);
+            cycleSpeed = rand(0.18, 0.45);
+          }
+        } else if (kind === 'inner') {
+          point = sampleInner();
+          const sizeRoll = Math.random();
+          if (sizeRoll < 0.68) {
+            size = rand(0.2, 0.52);
+            alpha = rand(0.32, 0.62);
+          } else if (sizeRoll < 0.96) {
+            size = rand(0.52, 0.9);
+            alpha = rand(0.2, 0.42);
+          } else {
+            size = rand(1.0, 1.7);
+            alpha = rand(0.055, 0.105);
+          }
+          wander = rand(0.001, 0.0045);
+          wanderSpeedX = rand(0.16, 0.46);
+          wanderSpeedY = rand(0.15, 0.42);
+          tangentAmount = rand(0.0003, 0.0018);
+          spring = rand(9, 15);
+          damping = rand(4.2, 6.4);
+        } else {
+          point = sampleOuter();
+          size = rand(0.22, 0.62);
+          alpha = rand(0.11, 0.27);
+          wander = rand(0.012, 0.045);
+          wanderSpeedX = rand(0.07, 0.24);
+          wanderSpeedY = rand(0.06, 0.22);
+          tangentAmount = 0;
+          spring = rand(1.4, 3.2);
+          damping = rand(0.35, 0.9);
+        }
+
+        // 极少量更亮、更大的星点，拉开层次
+        if (kind !== 'outer' && Math.random() < 0.014) {
+          size *= 1.45;
+          alpha = Math.min(0.68, alpha * 1.18);
+        }
+
+        const color = pickColor();
+        const tail = smoothstep(0.2, 0.9, point.y);
+
+        // 底部减少自由散布和环游幅度，让心尖轮廓保持收束。
+        if (kind === 'edge') {
+          cycleAmount *= 1 - 0.72 * tail;
+        }
+
+        return {
+          x: point.x + rand(-0.045, 0.045) * (1 - 0.8 * tail),
+          y: point.y + rand(-0.045, 0.045) * (1 - 0.62 * tail),
+          vx: 0,
+          vy: 0,
+          hx: point.x,
+          hy: point.y,
+          nx: point.nx,
+          ny: point.ny,
+          tx: point.tx,
+          ty: point.ty,
+          kind,
+          color,
+          size,
+          alpha,
+          wander,
+          wanderSpeedX,
+          wanderSpeedY,
+          phaseX: Math.random() * TAU,
+          phaseY: Math.random() * TAU,
+          tangentAmount,
+          cycleAmount,
+          cycleSpeed,
+          cyclePhase: Math.random() * TAU,
+          twinkleSpeed: rand(0.35, 1.4),
+          twinklePhase: Math.random() * TAU,
+          spring,
+          damping
+        };
+      }
+
+      function countForScale(scale) {
+        return Math.round(clamp(scale * scale * 0.17, 5000, 36000));
+      }
+
+      function buildParticles() {
+        const total = countForScale(sceneScale);
+        const edgeCount = Math.round(total * 0.65);
+        const innerCount = Math.round(total * 0.28);
+        const outerCount = total - edgeCount - innerCount;
+        const result = new Array(total);
+        const colors = new Float32Array(total * 3);
+        let index = 0;
+
+        function push(kind) {
+          const particle = createParticle(kind);
+          result[index] = particle;
+          colors[index * 3] = particle.color[0];
+          colors[index * 3 + 1] = particle.color[1];
+          colors[index * 3 + 2] = particle.color[2];
+          index++;
+        }
+
+        // 远处尘埃、内部颗粒、浓密轮廓依次创建
+        for (let i = 0; i < outerCount; i++) push('outer');
+        for (let i = 0; i < innerCount; i++) push('inner');
+        for (let i = 0; i < edgeCount; i++) push('edge');
+
+        particles = result;
+        particleCount = total;
+        dynamicData = new Float32Array(total * 4);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, dynamicData, gl.DYNAMIC_DRAW);
+        configureAttributes();
+      }
+
+      // ---------- WebGL ----------
+      function createShader(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          const message = gl.getShaderInfoLog(shader);
+          gl.deleteShader(shader);
+          throw new Error(message || 'Shader compile failed');
+        }
+
+        return shader;
+      }
+
+      function createProgram() {
+        const vertexSource = `
+          attribute vec2 a_position;
+          attribute float a_size;
+          attribute float a_alpha;
+          attribute vec3 a_color;
+
+          uniform vec2 u_resolution;
+          uniform float u_dpr;
+          uniform float u_pointScale;
+
+          varying vec3 v_color;
+          varying float v_alpha;
+
+          void main() {
+            vec2 clip = (a_position / u_resolution) * 2.0 - 1.0;
+            gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+            gl_PointSize = a_size * u_dpr * u_pointScale;
+            v_color = a_color;
+            v_alpha = a_alpha;
+          }
+        `;
+
+        const fragmentSource = `
+          precision mediump float;
+
+          uniform sampler2D u_glow;
+          uniform float u_intensity;
+          uniform float u_coreMix;
+
+          varying vec3 v_color;
+          varying float v_alpha;
+
+          void main() {
+            float mask = texture2D(u_glow, gl_PointCoord).a;
+            if (mask < 0.004) discard;
+
+            // 粒子核心偏白，边缘保留暖色光晕
+            float core = smoothstep(0.36, 1.0, mask);
+            vec3 color = mix(v_color, vec3(1.0, 0.96, 0.985), core * u_coreMix);
+            gl_FragColor = vec4(color, mask * v_alpha * u_intensity);
+          }
+        `;
+
+        const vertexShader = createShader(gl.VERTEX_SHADER, vertexSource);
+        const fragmentShader = createShader(gl.FRAGMENT_SHADER, fragmentSource);
+        const shaderProgram = gl.createProgram();
+
+        gl.attachShader(shaderProgram, vertexShader);
+        gl.attachShader(shaderProgram, fragmentShader);
+        gl.linkProgram(shaderProgram);
+        gl.deleteShader(vertexShader);
+        gl.deleteShader(fragmentShader);
+
+        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+          const message = gl.getProgramInfoLog(shaderProgram);
+          gl.deleteProgram(shaderProgram);
+          throw new Error(message || 'Program link failed');
+        }
+
+        return shaderProgram;
+      }
+
+      function createGlowTexture() {
+        const size = 96;
+        const sprite = document.createElement('canvas');
+        sprite.width = size;
+        sprite.height = size;
+
+        const sctx = sprite.getContext('2d');
+        const half = size / 2;
+        const gradient = sctx.createRadialGradient(
+          half, half, 0,
+          half, half, half
+        );
+
+        gradient.addColorStop(0, 'rgba(255,255,255,1)');
+        gradient.addColorStop(0.055, 'rgba(255,255,255,0.98)');
+        gradient.addColorStop(0.13, 'rgba(255,255,255,0.76)');
+        gradient.addColorStop(0.25, 'rgba(255,255,255,0.34)');
+        gradient.addColorStop(0.45, 'rgba(255,255,255,0.095)');
+        gradient.addColorStop(0.68, 'rgba(255,255,255,0.018)');
+        gradient.addColorStop(1, 'rgba(255,255,255,0)');
+
+        sctx.fillStyle = gradient;
+        sctx.fillRect(0, 0, size, size);
+
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          sprite
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+        return texture;
+      }
+
+      function configureAttributes() {
+        if (!positionBuffer || !colorBuffer) return;
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.enableVertexAttribArray(attributes.position);
+        gl.vertexAttribPointer(
+          attributes.position,
+          2,
+          gl.FLOAT,
+          false,
+          16,
+          0
+        );
+        gl.enableVertexAttribArray(attributes.size);
+        gl.vertexAttribPointer(
+          attributes.size,
+          1,
+          gl.FLOAT,
+          false,
+          16,
+          8
+        );
+        gl.enableVertexAttribArray(attributes.alpha);
+        gl.vertexAttribPointer(
+          attributes.alpha,
+          1,
+          gl.FLOAT,
+          false,
+          16,
+          12
+        );
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.enableVertexAttribArray(attributes.color);
+        gl.vertexAttribPointer(
+          attributes.color,
+          3,
+          gl.FLOAT,
+          false,
+          12,
+          0
+        );
+      }
+
+      function configureTextAttributes() {
+        if (!textPositionBuffer || !textColorBuffer) return;
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, textPositionBuffer);
+        gl.enableVertexAttribArray(attributes.position);
+        gl.vertexAttribPointer(
+          attributes.position,
+          2,
+          gl.FLOAT,
+          false,
+          16,
+          0
+        );
+        gl.enableVertexAttribArray(attributes.size);
+        gl.vertexAttribPointer(
+          attributes.size,
+          1,
+          gl.FLOAT,
+          false,
+          16,
+          8
+        );
+        gl.enableVertexAttribArray(attributes.alpha);
+        gl.vertexAttribPointer(
+          attributes.alpha,
+          1,
+          gl.FLOAT,
+          false,
+          16,
+          12
+        );
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, textColorBuffer);
+        gl.enableVertexAttribArray(attributes.color);
+        gl.vertexAttribPointer(
+          attributes.color,
+          3,
+          gl.FLOAT,
+          false,
+          12,
+          0
+        );
+      }
+
+      function configureDustAttributes() {
+        if (!dustPositionBuffer || !dustColorBuffer) return;
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, dustPositionBuffer);
+        gl.enableVertexAttribArray(attributes.position);
+        gl.vertexAttribPointer(
+          attributes.position,
+          2,
+          gl.FLOAT,
+          false,
+          16,
+          0
+        );
+        gl.enableVertexAttribArray(attributes.size);
+        gl.vertexAttribPointer(
+          attributes.size,
+          1,
+          gl.FLOAT,
+          false,
+          16,
+          8
+        );
+        gl.enableVertexAttribArray(attributes.alpha);
+        gl.vertexAttribPointer(
+          attributes.alpha,
+          1,
+          gl.FLOAT,
+          false,
+          16,
+          12
+        );
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, dustColorBuffer);
+        gl.enableVertexAttribArray(attributes.color);
+        gl.vertexAttribPointer(
+          attributes.color,
+          3,
+          gl.FLOAT,
+          false,
+          12,
+          0
+        );
+      }
+
+      // ---------- 粒子文字 ----------
+      // 先用离屏 Canvas 绘制字形，再把字形像素采样成粒子。
+      function buildTextScene() {
+        if (textRows) return;
+
+        const maskCanvas = document.createElement('canvas');
+        const maskContext = maskCanvas.getContext('2d', {
+          willReadFrequently: true
+        });
+        const font = `900 ${TEXT_DESIGN_FONT_SIZE}px "Microsoft YaHei", `
+          + '"PingFang SC", "Noto Sans SC", "Hiragino Sans GB", sans-serif';
+        const rows = [];
+        let total = 0;
+
+        for (let rowIndex = 0; rowIndex < NAME_ROWS.length; rowIndex++) {
+          const style = NAME_STYLES[rowIndex];
+          const sequence = NAME_ROWS[rowIndex].join('　') + '　　';
+
+          maskContext.font = font;
+          const measuredWidth = Math.ceil(
+            maskContext.measureText(sequence).width
+          );
+          const maskWidth = measuredWidth + 12;
+
+          maskCanvas.width = maskWidth;
+          maskCanvas.height = TEXT_DESIGN_HEIGHT;
+
+          maskContext.clearRect(0, 0, maskWidth, TEXT_DESIGN_HEIGHT);
+          maskContext.font = font;
+          maskContext.textAlign = 'left';
+          maskContext.textBaseline = 'middle';
+          maskContext.fillStyle = '#fff';
+          maskContext.fillText(
+            sequence,
+            6,
+            TEXT_DESIGN_HEIGHT / 2
+          );
+
+          const pixels = maskContext.getImageData(
+            0,
+            0,
+            maskWidth,
+            TEXT_DESIGN_HEIGHT
+          ).data;
+          const particles = [];
+          const step = TEXT_SAMPLE_STEP;
+          const offsetX = Math.random() * step;
+          const offsetY = Math.random() * step;
+
+          for (
+            let y = 10 + offsetY;
+            y < TEXT_DESIGN_HEIGHT - 10;
+            y += step
+          ) {
+            for (let x = 6 + offsetX; x < maskWidth - 6; x += step) {
+              const pixelIndex = (
+                Math.floor(y) * maskWidth + Math.floor(x)
+              ) * 4;
+
+              if (pixels[pixelIndex + 3] < 68) continue;
+              if (Math.random() < 0.08) continue;
+
+              const localX = x + (Math.random() - 0.5) * step * 1.15;
+              const localY = y - TEXT_DESIGN_HEIGHT / 2
+                + (Math.random() - 0.5) * step * 1.15;
+
+              const paletteColor = pickColor();
+              const colorJitter = rand(0.93, 1.04);
+              const whiten = Math.random() < (0.02 + 0.05 * style.highlight)
+                ? rand(0.18, 0.46)
+                : rand(0, 0.06);
+
+              let alpha = Math.min(
+                1,
+                rand(0.48, 0.72) * style.highlight
+              );
+              let size = rand(6, 10.5) * style.sizeScale;
+
+              // 少量更亮、更大的星点，让字形有和爱心一致的颗粒闪光。
+              if (Math.random() < 0.04 + 0.055 * style.highlight) {
+                size *= rand(1.25, 1.55);
+                alpha = Math.min(1, alpha * 1.12 + 0.05);
+              }
+
+              const red = clamp(
+                paletteColor[0] * colorJitter
+                  + (1 - paletteColor[0] * colorJitter) * whiten,
+                0,
+                1
+              );
+              const green = clamp(
+                paletteColor[1] * colorJitter
+                  + (1 - paletteColor[1] * colorJitter) * whiten,
+                0,
+                1
+              );
+              const blue = clamp(
+                paletteColor[2] * colorJitter
+                  + (1 - paletteColor[2] * colorJitter) * whiten,
+                0,
+                1
+              );
+
+              particles.push({
+                x: localX,
+                y: localY,
+                size,
+                alpha,
+                phase: Math.random() * TAU,
+                twinkleSpeed: rand(0.5, 1.35),
+                twinkleAmount: rand(0.06, 0.18),
+                red,
+                green,
+                blue
+              });
+            }
+          }
+
+          rows.push({
+            particles,
+            cycleWidth: maskWidth,
+            phase: Math.random() * maskWidth,
+            direction: rowIndex % 2 === 0 ? 1 : -1,
+            fromLeft: rowIndex % 2 === 0,
+            speed: style.speed
+          });
+
+          total += particles.length;
+        }
+
+        textParticleCount = total;
+        textDrawCount = total * TEXT_MAX_COPIES;
+        textDynamicData = new Float32Array(textDrawCount * 4);
+
+        const colorData = new Float32Array(textDrawCount * 3);
+        let colorIndex = 0;
+
+        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+          const rowParticles = rows[rowIndex].particles;
+
+          for (let i = 0; i < rowParticles.length; i++) {
+            const particle = rowParticles[i];
+
+            for (let copy = 0; copy < TEXT_MAX_COPIES; copy++) {
+              colorData[colorIndex * 3] = particle.red;
+              colorData[colorIndex * 3 + 1] = particle.green;
+              colorData[colorIndex * 3 + 2] = particle.blue;
+              colorIndex++;
+            }
+          }
+        }
+
+        if (!textPositionBuffer) {
+          textPositionBuffer = gl.createBuffer();
+          textColorBuffer = gl.createBuffer();
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, textColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colorData, gl.STATIC_DRAW);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, textPositionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, textDynamicData, gl.DYNAMIC_DRAW);
+
+        textRows = rows;
+      }
+
+      // 文字场景里的持续下坠尘埃：数量少、亮度低，落在文字下方，
+      // 因此只会显露在名字之间的空白处。
+      function buildAmbientDust() {
+        if (dustParticles) return;
+
+        const count = Math.round(clamp(width * height / 10000, 70, 160));
+        const particles = new Array(count);
+        const colors = new Float32Array(count * 3);
+
+        for (let i = 0; i < count; i++) {
+          const color = pickColor();
+          let size = rand(4, 7.5);
+          let alpha = rand(0.65, 0.85);
+
+          if (Math.random() < 0.12) {
+            size *= 1.35;
+            alpha = Math.min(1, alpha * 1.2);
+          }
+
+          particles[i] = {
+            x: rand(0.04, 0.96),
+            y: Math.random(),
+            speed: rand(0.012, 0.036),
+            size,
+            alpha,
+            sway: rand(0.002, 0.011),
+            swaySpeed: rand(0.18, 0.5),
+            phase: Math.random() * TAU,
+            twinkleSpeed: rand(0.35, 1.1),
+            twinkleAmount: rand(0.12, 0.32)
+          };
+
+          colors[i * 3] = color[0];
+          colors[i * 3 + 1] = color[1];
+          colors[i * 3 + 2] = color[2];
+        }
+
+        dustParticles = particles;
+        dustCount = count;
+        dustDynamicData = new Float32Array(count * 4);
+        dustPositionBuffer = gl.createBuffer();
+        dustColorBuffer = gl.createBuffer();
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, dustColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, dustPositionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, dustDynamicData, gl.DYNAMIC_DRAW);
+      }
+
+      function initWebGL() {
+        gl = canvas.getContext('webgl', {
+          alpha: false,
+          antialias: false,
+          depth: false,
+          stencil: false,
+          premultipliedAlpha: false,
+          powerPreference: 'high-performance'
+        });
+
+        if (!gl) {
+          canvas.style.display = 'none';
+          const message = document.createElement('p');
+          message.className = 'fallback';
+          message.textContent = '当前浏览器不支持 WebGL，请换用较新的浏览器。';
+          document.body.appendChild(message);
+          return false;
+        }
+
+        program = createProgram();
+        gl.useProgram(program);
+
+        attributes = {
+          position: gl.getAttribLocation(program, 'a_position'),
+          size: gl.getAttribLocation(program, 'a_size'),
+          alpha: gl.getAttribLocation(program, 'a_alpha'),
+          color: gl.getAttribLocation(program, 'a_color')
+        };
+        uniforms = {
+          resolution: gl.getUniformLocation(program, 'u_resolution'),
+          dpr: gl.getUniformLocation(program, 'u_dpr'),
+          glow: gl.getUniformLocation(program, 'u_glow'),
+          intensity: gl.getUniformLocation(program, 'u_intensity'),
+          coreMix: gl.getUniformLocation(program, 'u_coreMix'),
+          pointScale: gl.getUniformLocation(program, 'u_pointScale')
+        };
+
+        glowTexture = createGlowTexture();
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, glowTexture);
+        gl.uniform1i(uniforms.glow, 0);
+
+        gl.disable(gl.DEPTH_TEST);
+        gl.disable(gl.CULL_FACE);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+        positionBuffer = gl.createBuffer();
+        colorBuffer = gl.createBuffer();
+
+        return true;
+      }
+
+      // ---------- 尺寸与自适应 ----------
+      function updateViewport() {
+        width = window.innerWidth;
+        height = window.innerHeight;
+        dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+
+        canvas.width = Math.max(1, Math.round(width * dpr));
+        canvas.height = Math.max(1, Math.round(height * dpr));
+        gl.viewport(0, 0, canvas.width, canvas.height);
+
+        centerX = width / 2;
+        centerY = height * 0.525;
+        sceneScale = Math.min(width * 0.33, height * 0.41);
+        particleUnit = clamp(sceneScale / 405, 0.7, 1.3);
+
+        gl.uniform2f(uniforms.resolution, width, height);
+        gl.uniform1f(uniforms.dpr, dpr);
+      }
+
+      function resize() {
+        updateViewport();
+
+        window.clearTimeout(resizeTimer);
+        resizeTimer = window.setTimeout(() => {
+          if (interaction.state !== 'idle') return;
+
+          const desired = countForScale(sceneScale);
+
+          if (!particles.length
+            || Math.abs(desired - particles.length) / desired > 0.16) {
+            buildParticles();
+          }
+        }, 180);
+      }
+
+      // ---------- 鼠标 / 触摸吸引与点击 ----------
+      function isPointOnHeart(clientX, clientY) {
+        if (interaction.state !== 'idle' || sceneScale <= 0) return false;
+
+        const time = performance.now() * 0.001;
+        const scale = sceneScale * (1 + 0.026 * Math.sin(time * BREATH_SPEED));
+        const x = (clientX - centerX) / scale;
+        const y = (clientY - centerY) / scale;
+
+        if (isInsideHeart(x, y)) return true;
+
+        // 柔和光晕也算点击范围，稍微放宽边缘。
+        const margin = 0.055;
+        for (let i = 0; i < 8; i++) {
+          const angle = (i / 8) * TAU;
+          if (isInsideHeart(
+            x + Math.cos(angle) * margin,
+            y + Math.sin(angle) * margin
+          )) {
+            return true;
+          }
+        }
+
+        return false;
+      }
+
+      function setPointer(event) {
+        pointer.x = event.clientX;
+        pointer.y = event.clientY;
+        pointer.active = true;
+
+        if (interaction.state === 'idle') {
+          canvas.style.cursor = isPointOnHeart(
+            event.clientX,
+            event.clientY
+          ) ? 'pointer' : 'default';
+        }
+      }
+
+      function releasePointer() {
+        pointer.active = false;
+      }
+
+      function startHeartFall(clientX, clientY) {
+        if (!isPointOnHeart(clientX, clientY)) return;
+
+        const time = performance.now() * 0.001;
+        const scale = sceneScale * (1 + 0.026 * Math.sin(time * BREATH_SPEED));
+
+        interaction.state = 'falling';
+        pointer.active = false;
+        pointer.influence = 0;
+        canvas.style.cursor = 'default';
+
+        // 把粒子从“心形坐标”切换到屏幕像素坐标，随后只受重力影响。
+        // 给每颗粒子一点不同的初速度，让心形在坠落中自然散开。
+        for (let i = 0; i < particleCount; i++) {
+          const p = particles[i];
+          p.x = centerX + p.x * scale;
+          p.y = centerY + p.y * scale;
+          p.vx = p.nx * rand(18, 86) + rand(-28, 28);
+          p.vy = rand(-32, 62);
+        }
+
+        buildTextScene();
+        buildAmbientDust();
+        interaction.textStartTime = time + TEXT_START_DELAY;
+      }
+
+      window.addEventListener('pointermove', setPointer, { passive: true });
+      window.addEventListener('pointerdown', setPointer, { passive: true });
+      window.addEventListener('pointerup', (event) => {
+        if (event.pointerType !== 'mouse') releasePointer();
+      }, { passive: true });
+      window.addEventListener('pointercancel', releasePointer, { passive: true });
+      window.addEventListener('blur', releasePointer);
+      document.addEventListener('mouseleave', releasePointer);
+      window.addEventListener('mouseout', (event) => {
+        if (!event.relatedTarget) releasePointer();
+      });
+
+      canvas.addEventListener('pointerdown', (event) => {
+        if (event.pointerType === 'mouse' && event.button !== 0) return;
+        startHeartFall(event.clientX, event.clientY);
+      }, { passive: true });
+
+      // ---------- 动画 ----------
+      function drawHeartParticles() {
+        if (!particleCount) return;
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, dynamicData);
+        configureAttributes();
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        gl.uniform1f(uniforms.intensity, 0.8);
+        gl.uniform1f(uniforms.coreMix, 0.3);
+        gl.uniform1f(uniforms.pointScale, 1);
+        gl.drawArrays(gl.POINTS, 0, particleCount);
+      }
+
+      function drawTextParticles(time) {
+        if (!textRows || time < interaction.textStartTime) return;
+
+        const elapsed = time - interaction.textStartTime;
+        const textScale = height * 0.00106;
+        const dynamic = textDynamicData;
+        let cursor = 0;
+
+        for (let rowIndex = 0; rowIndex < textRows.length; rowIndex++) {
+          const row = textRows[rowIndex];
+          const reveal = clamp(
+            (elapsed - rowIndex * TEXT_ROW_DELAY) / TEXT_REVEAL_DURATION,
+            0,
+            1
+          );
+          const easedReveal = 1 - Math.pow(1 - reveal, 3);
+          const cycleWidth = row.cycleWidth * textScale;
+          const rowCenterY = height * (rowIndex + 0.5) / 5;
+          const scroll = row.direction * height * row.speed * elapsed;
+          const phase = row.phase * textScale;
+          const revealFront = (width + 100) * easedReveal;
+
+          for (let i = 0; i < row.particles.length; i++) {
+            const p = row.particles[i];
+            let baseX = (
+              p.x * textScale + phase + scroll
+            ) % cycleWidth;
+
+            if (baseX < 0) baseX += cycleWidth;
+
+            const y = rowCenterY
+              + p.y * textScale
+              + Math.sin(time * 0.72 + p.phase) * 0.7 * textScale;
+            const twinkle = 1 + Math.sin(
+              time * p.twinkleSpeed + p.phase
+            ) * p.twinkleAmount;
+            const baseAlpha = reveal > 0 ? p.alpha * twinkle : 0;
+
+            for (let copy = 0; copy < TEXT_MAX_COPIES; copy++) {
+              const px = baseX + copy * cycleWidth;
+              let alpha = baseAlpha;
+
+              if (alpha > 0 && easedReveal < 1) {
+                if (row.fromLeft) {
+                  if (px > revealFront) {
+                    alpha = 0;
+                  } else if (px > revealFront - 90) {
+                    alpha *= clamp((revealFront - px) / 90, 0, 1);
+                  }
+                } else {
+                  const startX = width - revealFront;
+                  if (px < startX) {
+                    alpha = 0;
+                  } else if (px < startX + 90) {
+                    alpha *= clamp((px - startX) / 90, 0, 1);
+                  }
+                }
+              }
+
+              const pixelSize = p.size * textScale;
+              if (px < -pixelSize || px > width + pixelSize) {
+                alpha = 0;
+              }
+
+              const offset = cursor * 4;
+              dynamic[offset] = px;
+              dynamic[offset + 1] = y;
+              dynamic[offset + 2] = pixelSize;
+              dynamic[offset + 3] = alpha;
+              cursor++;
+            }
+          }
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, textPositionBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, textDynamicData);
+        configureTextAttributes();
+        gl.uniform1f(uniforms.pointScale, 1);
+        gl.uniform1f(uniforms.intensity, 1.9);
+        gl.uniform1f(uniforms.coreMix, 0.14);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+        gl.drawArrays(gl.POINTS, 0, textDrawCount);
+
+        // 再叠一层与爱心相同的加法柔光；中心行的粒子数量感和尺寸更大，
+        // 因此高亮会自然从中间向上下两端递减。
+        gl.uniform1f(uniforms.pointScale, 1.65);
+        gl.uniform1f(uniforms.intensity, 0.17);
+        gl.uniform1f(uniforms.coreMix, 0.06);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        gl.drawArrays(gl.POINTS, 0, textDrawCount);
+
+        gl.uniform1f(uniforms.pointScale, 1);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      }
+
+      function drawAmbientDust(time) {
+        if (!dustParticles || time < interaction.textStartTime) return;
+
+        const elapsed = time - interaction.textStartTime;
+        const intro = clamp(elapsed / 1.1, 0, 1);
+        const sizeScale = clamp(height / 1000, 0.7, 1.4);
+        const span = height + 100;
+        let cursor = 0;
+
+        for (let i = 0; i < dustCount; i++) {
+          const p = dustParticles[i];
+          const y = (
+            p.y * height + elapsed * p.speed * height
+          ) % span - 50;
+          const x = p.x * width
+            + Math.sin(elapsed * p.swaySpeed + p.phase) * p.sway * width;
+
+          let alpha = p.alpha * intro * (
+            0.8 + 0.2 * Math.sin(elapsed * p.twinkleSpeed + p.phase)
+          );
+
+          if (y < 40) {
+            alpha *= smoothstep(-50, 40, y);
+          } else if (y > height - 40) {
+            alpha *= 1 - smoothstep(height - 40, height + 50, y);
+          }
+
+          const offset = cursor * 4;
+          dustDynamicData[offset] = x;
+          dustDynamicData[offset + 1] = y;
+          dustDynamicData[offset + 2] = p.size * sizeScale;
+          dustDynamicData[offset + 3] = alpha;
+          cursor++;
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, dustPositionBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, dustDynamicData);
+        configureDustAttributes();
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+        gl.uniform1f(uniforms.intensity, 2.6);
+        gl.uniform1f(uniforms.coreMix, 0.3);
+        gl.uniform1f(uniforms.pointScale, 1);
+        gl.drawArrays(gl.POINTS, 0, dustCount);
+      }
+
+      function updateFall(time, dt) {
+        let alive = 0;
+
+        for (let i = 0; i < particleCount; i++) {
+          const p = particles[i];
+          const offset = i * 4;
+
+          if (p.y <= height + 80) {
+            alive++;
+            p.vy += FALL_GRAVITY * dt;
+            p.vx += Math.sin(
+              time * p.wanderSpeedX + p.phaseX
+            ) * 7 * dt;
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+          }
+
+          const px = p.x;
+          const py = p.y;
+          const diameter = p.size * BASE_DIAMETER * particleUnit;
+
+          // 靠近屏幕底部时淡出，避免几十万粒子在底边堆成过曝的白带。
+          const fade = clamp((height + 28 - py) / 96, 0, 1);
+
+          if (fade < 0.004
+            || px < -diameter || px > width + diameter
+            || py < -diameter) {
+            dynamicData[offset + 3] = 0;
+            continue;
+          }
+
+          dynamicData[offset] = px;
+          dynamicData[offset + 1] = py;
+          dynamicData[offset + 2] = diameter;
+          dynamicData[offset + 3] = p.alpha * fade;
+        }
+
+        if (!alive) {
+          interaction.state = 'done';
+        }
+      }
+
+      function updateAndDraw(time, dt) {
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        if (interaction.state === 'falling') {
+          updateFall(time, dt);
+          drawHeartParticles();
+          drawAmbientDust(time);
+          drawTextParticles(time);
+          return;
+        }
+
+        if (interaction.state === 'done') {
+          drawAmbientDust(time);
+          drawTextParticles(time);
+          return;
+        }
+
+        const breath = 1 + 0.026 * Math.sin(time * BREATH_SPEED);
+        const scale = sceneScale * breath;
+        const targetInfluence = pointer.active ? 1 : 0;
+        const influenceEase = 1 - Math.exp(-dt * 5.2);
+
+        pointer.influence +=
+          (targetInfluence - pointer.influence) * influenceEase;
+
+        const mouseActive = pointer.influence > 0.006;
+        const mouseX = (pointer.x - centerX) / scale;
+        const mouseY = (pointer.y - centerY) / scale;
+        const mouseRadius = 0.55;
+        const mouseRadiusSq = mouseRadius * mouseRadius;
+
+        for (let i = 0; i < particleCount; i++) {
+          const p = particles[i];
+
+          const wanderX = Math.sin(
+            time * p.wanderSpeedX + p.phaseX
+          ) * p.wander;
+          const wanderY = Math.cos(
+            time * p.wanderSpeedY + p.phaseY
+          ) * p.wander * 0.82;
+
+          let targetX = p.hx + wanderX;
+          let targetY = p.hy + wanderY;
+          let driftProgress = 0;
+
+          if (p.cycleAmount > 0) {
+            driftProgress = 0.5 - 0.5 * Math.cos(
+              time * p.cycleSpeed + p.cyclePhase
+            );
+            targetX += p.nx * p.cycleAmount * driftProgress;
+            targetY += p.ny * p.cycleAmount * driftProgress;
+          }
+
+          if (p.tangentAmount > 0) {
+            const sway = Math.sin(
+              time * (p.wanderSpeedX * 0.7 + 0.12) + p.phaseY
+            ) * p.tangentAmount;
+            targetX += p.tx * sway;
+            targetY += p.ty * sway;
+          }
+
+          let ax = (targetX - p.x) * p.spring;
+          let ay = (targetY - p.y) * p.spring;
+
+          if (mouseActive) {
+            const dx = mouseX - p.x;
+            const dy = mouseY - p.y;
+            const distanceSq = dx * dx + dy * dy;
+
+            if (distanceSq < mouseRadiusSq && distanceSq > 0.000001) {
+              const distance = Math.sqrt(distanceSq);
+              const falloff = 1 - distance / mouseRadius;
+              const pull = falloff * falloff * 2.0 * pointer.influence;
+
+              ax += (dx / distance) * pull;
+              ay += (dy / distance) * pull;
+              ax += (-dy / distance) * pull * 0.13;
+              ay += (dx / distance) * pull * 0.13;
+            }
+          }
+
+          p.vx = (p.vx + ax * dt) * Math.exp(-p.damping * dt);
+          p.vy = (p.vy + ay * dt) * Math.exp(-p.damping * dt);
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+
+          let alpha = p.alpha * (
+            0.82 + 0.18 * Math.sin(
+              time * p.twinkleSpeed + p.twinklePhase
+            )
+          );
+
+          if (driftProgress > 0) {
+            alpha *= 1 - driftProgress * 0.38;
+          }
+
+          const px = centerX + p.x * scale;
+          const py = centerY + p.y * scale;
+          const diameter = p.size * BASE_DIAMETER * particleUnit
+            * (1 + driftProgress * 0.12);
+
+          const offset = i * 4;
+          if (alpha < 0.004
+            || px < -diameter || px > width + diameter
+            || py < -diameter || py > height + diameter) {
+            dynamicData[offset + 3] = 0;
+            continue;
+          }
+
+          dynamicData[offset] = px;
+          dynamicData[offset + 1] = py;
+          dynamicData[offset + 2] = diameter;
+          dynamicData[offset + 3] = alpha;
+        }
+
+        drawHeartParticles();
+        drawTextParticles(time);
+      }
+
+      function animate(now) {
+        if (!lastTime) lastTime = now;
+        const time = now / 1000;
+        const dt = Math.min(0.035, Math.max(0.001, (now - lastTime) / 1000));
+        lastTime = now;
+
+        updateAndDraw(time, dt);
+        requestAnimationFrame(animate);
+      }
+
+      // ---------- 启动 ----------
+      createOutline();
+
+      if (initWebGL()) {
+        updateViewport();
+        buildParticles();
+        window.addEventListener('resize', resize);
+        window.addEventListener('orientationchange', resize);
+        requestAnimationFrame(animate);
+      }
+    })();
+  </script>
+</body>
+</html>
